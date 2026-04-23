@@ -14,7 +14,6 @@ class NotificationManager:
     """统一通知管理器"""
     
     def __init__(self):
-        # 获取环境变量
         self.gotify_url = os.environ.get("GOTIFY_URL")
         self.gotify_token = os.environ.get("GOTIFY_TOKEN")
         self.sc3_push_key = os.environ.get("SC3_PUSH_KEY")
