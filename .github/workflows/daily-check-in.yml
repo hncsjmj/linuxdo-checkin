@@ -2,9 +2,7 @@ name: Daily Check-in
 
 on:
   schedule:
-    #- cron: '0 1 * * *'  # 每天1点 UTC 时间执行
-    - cron: '32 */12 * * *'  # 每12小时执行一次
-
+    - cron: '0 */12 * * *' # 每12小时执行一次
   workflow_dispatch:
 
 jobs:
@@ -12,14 +10,19 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: browser-actions/setup-chrome@v1
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
       - name: Check Chrome version
         run: chrome --version
-        
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9.19'
+          python-version: '3.12'
 
       - name: Install python dependencies
         run: |
