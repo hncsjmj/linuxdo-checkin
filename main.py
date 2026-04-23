@@ -83,7 +83,6 @@ class LinuxDoBrowser:
             .set_argument("--disable-gpu")
             .set_argument("--disable-dev-shm-usage")
             .set_argument("--window-size=1920,1080")
-            # 关键: 绕过 Cloudflare 的 headless 检测
             .set_argument("--disable-blink-features=AutomationControlled")
         )
         co.set_user_agent(
@@ -92,9 +91,10 @@ class LinuxDoBrowser:
         self.browser = Chromium(co)
         self.page = self.browser.new_tab()
 
-        # 注入反检测 JS: 覆盖 navigator.webdriver
+        # 注入反检测 JS
         self.page.run_js_loaded("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = {runtime: {}};
         """)
 
         self.session = requests.Session()
@@ -106,7 +106,6 @@ class LinuxDoBrowser:
             }
         )
         self.notifier = NotificationManager()
-        # 保存从浏览器获取的 cookie，用于后续 API 请求
         self._dp_cookies = {}
 
     @staticmethod
@@ -127,7 +126,6 @@ class LinuxDoBrowser:
         return cookies
 
     def _sync_cookies_to_session(self):
-        """从 DrissionPage 浏览器同步 cookie 到 curl_cffi session，用于后续 API 请求"""
         try:
             dp_cookies = self.page.cookies()
             self._dp_cookies = {}
@@ -141,6 +139,73 @@ class LinuxDoBrowser:
         except Exception as e:
             logger.warning(f"同步 Cookie 到 session 失败: {e}")
 
+    def _is_cf_challenge_page(self):
+        """判断当前页面是否在 Cloudflare 挑战页
+        关键：不能只检查 'challenge-platform' 是否在 HTML 中，
+        因为 Discourse 正常页面也可能包含该字符串。
+        真正的 CF 挑战页特征：标题包含 'just a moment'，或页面极短且包含特定 CF 标识。
+        """
+        try:
+            title = (self.page.title or "").lower()
+            html = self.page.html or ""
+
+            # CF 经典挑战页标题
+            if "just a moment" in title:
+                return True
+            if "checking your browser" in title:
+                return True
+            if "please wait" in title and len(html) < 5000:
+                return True
+
+            # 短页面 + CF 特征 = 还在挑战
+            if len(html) < 5000:
+                if "challenge-platform" in html or "cf-browser-verification" in html:
+                    return True
+                if "enable javascript" in html.lower() and "cloudflare" in html.lower():
+                    return True
+
+            return False
+        except Exception:
+            return True  # 出错时保守判断为 CF 页
+
+    def _wait_for_cf_challenge(self, timeout=60):
+        """等待 Cloudflare Challenge 页面通过"""
+        logger.info("等待 Cloudflare 验证通过...")
+        start = time.time()
+        while time.time() - start < timeout:
+            if not self._is_cf_challenge_page():
+                elapsed = time.time() - start
+                logger.info(f"Cloudflare 验证已通过 (耗时 {elapsed:.1f}s)")
+                return True
+
+            logger.debug(f"仍在 CF 挑战页，继续等待... ({time.time()-start:.0f}s)")
+            time.sleep(3)
+
+        logger.warning(f"Cloudflare 验证等待超时（{timeout}s）")
+        # 打印调试信息
+        try:
+            logger.debug(f"当前页面标题: {self.page.title}")
+            logger.debug(f"当前 HTML 长度: {len(self.page.html or '')}")
+        except Exception:
+            pass
+        return False
+
+    def _wait_for_page_ready(self, timeout=20):
+        """等待页面实质性内容加载完成"""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                html = self.page.html or ""
+                # Discourse 论坛页面加载后会有这些特征
+                if len(html) > 100000 and "discourse" in html.lower():
+                    logger.info("页面已完全加载")
+                    return True
+            except Exception:
+                pass
+            time.sleep(2)
+        logger.warning("页面加载等待超时")
+        return False
+
     def login_with_cookies(self, cookie_str: str) -> bool:
         """使用手动设置的 Cookie 直接登录"""
         logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
@@ -151,114 +216,170 @@ class LinuxDoBrowser:
 
         logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
 
-        # 设置到 DrissionPage
-        self.page.set.cookies(dp_cookies)
+        # 第1步：先导航到 linux.do，让浏览器自行通过 CF 挑战，获取 cf_clearance
+        logger.info("先导航至 linux.do 建立 CF cookie...")
+        self.page.get(HOME_URL)
 
-        # 也设置到 curl_cffi session
+        # 等待 CF 挑战通过（首次访问可能需要较长时间）
+        cf_passed = self._wait_for_cf_challenge(timeout=60)
+        if not cf_passed:
+            logger.error("首次访问未能通过 Cloudflare")
+            return False
+
+        # 等待页面完全加载
+        self._wait_for_page_ready(timeout=20)
+        time.sleep(3)
+
+        # 第2步：设置用户 Cookie
+        logger.info("设置用户 Cookie...")
+        self.page.set.cookies(dp_cookies)
         for ck in dp_cookies:
             self.session.cookies.set(ck["name"], ck["value"], domain="linux.do")
 
-        logger.info("Cookie 设置完成，导航至 linux.do...")
+        # 第3步：刷新页面让 Cookie 生效
+        logger.info("Cookie 设置完成，刷新页面...")
         self.page.get(HOME_URL)
-
-        # 等待 Cloudflare Challenge 通过
         self._wait_for_cf_challenge(timeout=30)
+        self._wait_for_page_ready(timeout=20)
+        time.sleep(3)
 
-        # 从浏览器同步最新的 cookie（CF 会追加新 cookie）
+        # 同步浏览器 Cookie 到 session
         self._sync_cookies_to_session()
 
-        # 验证登录状态 - 多种方式
         return self._verify_login()
 
     def login(self):
-        """账号密码登录 - 通过浏览器方式而非 API，避开 Cloudflare"""
+        """账号密码登录 - 通过浏览器方式"""
         logger.info("开始账号密码登录（浏览器方式）")
         self.page.get(LOGIN_URL)
+        self._wait_for_cf_challenge(timeout=60)
+        self._wait_for_page_ready(timeout=20)
 
-        # 等待 Cloudflare Challenge 通过
-        self._wait_for_cf_challenge(timeout=30)
-
+        # Discourse 需要先点击登录按钮弹出模态框
         try:
-            # 等待登录表单出现
-            login_field = self.page.ele("#login-account-name", timeout=10)
-            password_field = self.page.ele("#login-account-password", timeout=10)
+            # 尝试找登录按钮
+            login_btn = None
+            for selector in ['.login-button', '.btn.btn-primary.btn-small.login-button',
+                           'button.login-button', 'a.login-button']:
+                try:
+                    login_btn = self.page.ele(selector, timeout=3)
+                    if login_btn:
+                        logger.info(f"找到登录按钮: {selector}")
+                        login_btn.click()
+                        time.sleep(3)
+                        break
+                except Exception:
+                    continue
 
-            if not login_field or not password_field:
+            # 尝试找表单（可能已经在模态框中）
+            login_field = self.page.ele("#login-account-name", timeout=5)
+            if not login_field:
+                # 尝试通过文本点击
+                try:
+                    header_login = self.page.ele("text:Log In", timeout=5) or self.page.ele("text:登录", timeout=5)
+                    if header_login:
+                        header_login.click()
+                        time.sleep(3)
+                except Exception:
+                    pass
+                login_field = self.page.ele("#login-account-name", timeout=5)
+
+            if not login_field:
                 logger.error("未找到登录表单元素")
+                logger.debug(f"当前 URL: {self.page.url}")
+                logger.debug(f"当前标题: {self.page.title}")
                 return False
+
+            password_field = self.page.ele("#login-account-password", timeout=5)
 
             login_field.input(USERNAME)
             time.sleep(random.uniform(0.5, 1.5))
             password_field.input(PASSWORD)
             time.sleep(random.uniform(0.5, 1.0))
 
-            # 点击登录按钮
-            login_btn = self.page.ele("@type=submit", timeout=5)
-            if login_btn:
-                login_btn.click()
+            submit_btn = self.page.ele("#login-button", timeout=5)
+            if not submit_btn:
+                submit_btn = self.page.ele("button.btn-primary", timeout=3)
+            if submit_btn:
+                submit_btn.click()
             else:
-                logger.error("未找到登录按钮")
+                logger.error("未找到提交按钮")
                 return False
 
-            # 等待登录完成
-            time.sleep(5)
-
-            # 同步 cookie
+            time.sleep(8)
             self._sync_cookies_to_session()
-
             return self._verify_login()
         except Exception as e:
             logger.error(f"浏览器登录失败: {e}")
             return False
 
-    def _wait_for_cf_challenge(self, timeout=30):
-        """等待 Cloudflare Challenge 页面通过"""
-        logger.info("等待 Cloudflare 验证通过...")
-        start = time.time()
-        while time.time() - start < timeout:
-            title = self.page.title or ""
-            html = self.page.html or ""
-            # CF challenge 页面通常标题包含 "Just a moment" 或有 challenge-platform 脚本
-            if "just a moment" not in title.lower() and "challenge-platform" not in html:
-                logger.info("Cloudflare 验证已通过")
-                return True
-            time.sleep(2)
-        logger.warning(f"Cloudflare 验证等待超时（{timeout}s），继续尝试...")
-        return False
-
     def _verify_login(self) -> bool:
         """多种方式验证登录状态"""
-        time.sleep(3)
+        time.sleep(5)
+
+        # 方式1: 检查 current-user 元素（最可靠）
         try:
-            # 方式1: 检查 current-user 元素
-            user_ele = self.page.ele("@id=current-user", timeout=5)
+            user_ele = self.page.ele("@id=current-user", timeout=10)
             if user_ele:
-                logger.info("Cookie 登录验证成功 (current-user)")
+                logger.info("登录验证成功 (current-user 元素)")
                 return True
         except Exception:
             pass
 
+        # 方式2: 检查页面中是否有 current-user 相关内容
         try:
-            # 方式2: 检查页面中是否有 avatar
-            if "avatar" in (self.page.html or ""):
-                logger.info("Cookie 登录验证成功 (avatar)")
+            html = self.page.html or ""
+            if 'id="current-user"' in html or "current-user" in html and "avatar" in html:
+                logger.info("登录验证成功 (HTML 特征)")
                 return True
         except Exception:
             pass
 
+        # 方式3: 通过 Discourse API 验证
         try:
-            # 方式3: 通过 Discourse API 验证
+            self._sync_cookies_to_session()
             resp = self.session.get(
                 "https://linux.do/session/current.json",
-                headers={"Accept": "application/json"},
+                headers={
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
                 impersonate="chrome136",
                 timeout=10,
             )
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("current_user"):
-                    logger.info(f"Cookie 登录验证成功 (API: {data['current_user'].get('username', '')})")
+                    logger.info(f"登录验证成功 (API: {data['current_user'].get('username', '')})")
                     return True
+            else:
+                logger.debug(f"API 验证返回状态码: {resp.status_code}")
+        except Exception as e:
+            logger.debug(f"API 验证异常: {e}")
+
+        # 方式4: 检查用户菜单按钮
+        try:
+            user_menu = self.page.ele(".header-dropdown-toggle.current-user", timeout=3)
+            if user_menu:
+                logger.info("登录验证成功 (用户菜单)")
+                return True
+        except Exception:
+            pass
+
+        # 调试信息
+        try:
+            logger.debug(f"验证时 URL: {self.page.url}")
+            logger.debug(f"验证时标题: {self.page.title}")
+            html = self.page.html or ""
+            if self._is_cf_challenge_page():
+                logger.error("页面仍在 Cloudflare 挑战页")
+            elif len(html) < 10000:
+                logger.error(f"页面内容过短 ({len(html)} 字符)")
+                logger.debug(f"页面内容: {html[:500]}")
+            else:
+                logger.debug(f"HTML 长度: {len(html)}")
+                logger.debug(f"包含 current-user: {'current-user' in html}")
+                logger.debug(f"包含 avatar: {'avatar' in html}")
         except Exception:
             pass
 
@@ -266,7 +387,22 @@ class LinuxDoBrowser:
         return False
 
     def click_topic(self):
-        topic_list = self.page.ele("@id=list-area").eles(".:title")
+        # 确保在首页
+        if self.page.url != HOME_URL:
+            self.page.get(HOME_URL)
+            self._wait_for_page_ready(timeout=15)
+
+        try:
+            list_area = self.page.ele("@id=list-area", timeout=15)
+        except Exception:
+            logger.error("未找到帖子列表区域 (#list-area)")
+            return False
+
+        if not list_area:
+            logger.error("帖子列表区域为空")
+            return False
+
+        topic_list = list_area.eles(".:title")
         if not topic_list:
             logger.error("未找到主题帖")
             return False
@@ -283,6 +419,7 @@ class LinuxDoBrowser:
         new_page = self.browser.new_tab()
         try:
             new_page.get(topic_url)
+            time.sleep(3)
             if random.random() < 0.3:
                 self.click_like(new_page)
             self.browse_post(new_page)
@@ -332,40 +469,49 @@ class LinuxDoBrowser:
             logger.error(f"点赞失败: {str(e)}")
 
     def print_connect_info(self):
-        """获取 Connect 信息 - 优先使用浏览器方式"""
+        """获取 Connect 信息"""
         logger.info("获取连接信息")
 
-        # 方式1: 使用浏览器直接访问 connect.linux.do
         try:
             connect_page = self.browser.new_tab()
             connect_page.get("https://connect.linux.do/")
-            self._wait_for_cf_challenge(timeout=15)
-            time.sleep(3)
 
-            connect_html = connect_page.html or ""
-            if "challenge-platform" not in connect_html:
-                soup = BeautifulSoup(connect_html, "html.parser")
-                rows = soup.select("table tr")
-                info = []
-                for row in rows:
-                    cells = row.select("td")
-                    if len(cells) >= 3:
-                        project = cells[0].text.strip()
-                        current = cells[1].text.strip() if cells[1].text.strip() else "0"
-                        requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
-                        info.append([project, current, requirement])
-
-                if info:
-                    logger.info("--------------Connect Info-----------------")
-                    logger.info("\n" + tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
-                else:
-                    logger.warning("Connect Info 页面未找到表格数据")
-
+            # 等待页面加载（可能也有 CF）
+            start = time.time()
+            while time.time() - start < 20:
                 try:
-                    connect_page.close()
+                    html = connect_page.html or ""
+                    # 非挑战页且有实质内容
+                    if len(html) > 1000 and "just a moment" not in (connect_page.title or "").lower():
+                        break
                 except Exception:
                     pass
-                return
+                time.sleep(3)
+
+            time.sleep(3)
+            connect_html = connect_page.html or ""
+            soup = BeautifulSoup(connect_html, "html.parser")
+            rows = soup.select("table tr")
+            info = []
+            for row in rows:
+                cells = row.select("td")
+                if len(cells) >= 3:
+                    project = cells[0].text.strip()
+                    current = cells[1].text.strip() if cells[1].text.strip() else "0"
+                    requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
+                    info.append([project, current, requirement])
+
+            if info:
+                logger.info("--------------Connect Info-----------------")
+                logger.info("\n" + tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+            else:
+                logger.warning("Connect Info: 未找到表格数据")
+
+            try:
+                connect_page.close()
+            except Exception:
+                pass
+            return
         except Exception as e:
             logger.warning(f"浏览器方式获取 Connect Info 失败: {e}")
             try:
@@ -373,10 +519,10 @@ class LinuxDoBrowser:
             except Exception:
                 pass
 
-        # 方式2: 回退到 curl_cffi
+        # 回退到 curl_cffi
         try:
             headers = {
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             }
             resp = self.session.get(
                 "https://connect.linux.do/", headers=headers, impersonate="chrome136"
@@ -396,7 +542,7 @@ class LinuxDoBrowser:
                 logger.info("--------------Connect Info-----------------")
                 logger.info("\n" + tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
             else:
-                logger.warning("Connect Info: 未能获取数据（可能被 Cloudflare 拦截）")
+                logger.warning("Connect Info: 未能获取数据")
         except Exception as e:
             logger.error(f"获取 Connect Info 失败: {e}")
 
@@ -422,7 +568,11 @@ class LinuxDoBrowser:
 
             if not login_res:
                 logger.warning("登录验证失败")
-                # 仍然尝试继续执行，有时验证不够准确
+            else:
+                # 确保页面在首页
+                if self.page.url != HOME_URL:
+                    self.page.get(HOME_URL)
+                    self._wait_for_page_ready(timeout=15)
 
             if BROWSE_ENABLED:
                 click_topic_res = self.click_topic()
